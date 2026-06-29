@@ -1,0 +1,7 @@
+flask>=3.0
+gunicorn
+numpy
+Pillow
+scipy
+scikit-image
+openpyxl
