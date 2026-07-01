@@ -47,6 +47,8 @@ def get_store() -> dict:
             "current_records": [],
             "current_image_file": None,
             "current_tif_name": "",
+            "current_img_width": 2048,
+            "current_img_height": 2048,
         }
     return STORE[sid]
 
@@ -196,6 +198,16 @@ def analyze():
     store["current_records"] = records
     store["current_image_file"] = ann_filename
     store["current_tif_name"] = tif_name
+    store["current_img_width"] = img_w
+    store["current_img_height"] = img_h
+
+    # If scale bar wasn't detected, ask the user to enter it before reviewing
+    if nm_per_pixel is None:
+        return render_template_string(SCALE_HTML,
+            tif_name=tif_name,
+            image_file=ann_filename,
+            dot_count=len(store["accumulated"]),
+            file_count=store["file_count"])
 
     return render_template_string(REVIEW_HTML,
         tif_name=tif_name,
@@ -205,7 +217,33 @@ def analyze():
         img_height=img_h,
         dot_count=len(store["accumulated"]),
         file_count=store["file_count"],
-        nm_calibrated=(nm_per_pixel is not None))
+        nm_calibrated=True)
+
+
+@app.route("/apply-scale", methods=["POST"])
+def apply_scale():
+    store = get_store()
+    records = store["current_records"]
+
+    try:
+        nm_per_pixel = float(request.form.get("nm_per_pixel", ""))
+        if nm_per_pixel <= 0:
+            raise ValueError
+        for rec in records:
+            rec["length_nm"] = round(rec["length_px"] * nm_per_pixel, 3)
+        nm_calibrated = True
+    except (ValueError, TypeError):
+        nm_calibrated = False  # user skipped — keep pixel-only values
+
+    return render_template_string(REVIEW_HTML,
+        tif_name=store["current_tif_name"],
+        records=records,
+        image_file=store["current_image_file"],
+        img_width=store["current_img_width"],
+        img_height=store["current_img_height"],
+        dot_count=len(store["accumulated"]),
+        file_count=store["file_count"],
+        nm_calibrated=nm_calibrated)
 
 
 @app.route("/confirm", methods=["POST"])
@@ -457,6 +495,101 @@ zone.addEventListener('drop', e => {
 """.replace("{{ css }}", _BASE_CSS)
 
 
+SCALE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enter Scale — {{ tif_name }}</title>
+<style>
+{{ css }}
+.scale-layout { display: grid; grid-template-columns: 1fr 360px; gap: 24px; align-items: start; }
+@media (max-width: 700px) { .scale-layout { grid-template-columns: 1fr; } }
+.img-thumb { border-radius: 8px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.15); background:#111; }
+.img-thumb img { width: 100%; display: block; }
+.warn-banner {
+  background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px;
+  padding: 14px 18px; margin-bottom: 20px; font-size: 0.9rem; color: #5d4037;
+  display: flex; align-items: flex-start; gap: 10px;
+}
+.scale-input-row { display: flex; gap: 10px; align-items: center; margin: 16px 0; }
+.scale-input-row input {
+  flex: 1; padding: 10px 12px; border: 1.5px solid #b0bec5; border-radius: 7px;
+  font-size: 1rem; outline: none;
+}
+.scale-input-row input:focus { border-color: #1976d2; }
+.scale-hint { font-size: 0.8rem; color: #78909c; margin-bottom: 20px; line-height: 1.5; }
+.divider { display:flex; align-items:center; gap:12px; color:#b0bec5;
+           font-size:0.8rem; margin: 20px 0; }
+.divider::before, .divider::after { content:''; flex:1; height:1px; background:#e0e0e0; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>TEM Quantum Dot Analyzer</h1>
+    <div class="subtitle">Scale calibration — {{ tif_name }}</div>
+  </div>
+</header>
+
+<div class="container wide" style="padding-top:24px;">
+  {% if dot_count > 0 %}
+  <div class="badge" style="margin-bottom:20px;">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <polyline points="20 6 9 17 4 12"></polyline>
+    </svg>
+    Session: {{ dot_count }} dot{{ 's' if dot_count != 1 else '' }} confirmed from {{ file_count }} image{{ 's' if file_count != 1 else '' }}
+  </div>
+  {% endif %}
+
+  <div class="scale-layout">
+    <div>
+      <div class="img-thumb">
+        <img src="/image/{{ image_file }}" alt="TEM image">
+      </div>
+    </div>
+
+    <div class="card" style="padding:24px;">
+      <div class="warn-banner">
+        <span style="font-size:1.2rem;">⚠️</span>
+        <div>
+          <strong>Scale bar not detected.</strong><br>
+          The image may not have a readable scale bar, or it wasn't recognised.
+          Enter the calibration below to get nm measurements, or skip to use pixel values only.
+        </div>
+      </div>
+
+      <form action="/apply-scale" method="post">
+        <h2 style="margin-bottom:12px;">Enter scale calibration</h2>
+
+        <label style="font-size:0.88rem;font-weight:600;color:#37474f;">
+          Nanometres per pixel (nm/px)
+        </label>
+        <div class="scale-input-row">
+          <input type="number" name="nm_per_pixel" step="any" min="0.0001"
+                 placeholder="e.g. 0.0571" autofocus>
+          <button type="submit" class="btn btn-primary">Apply →</button>
+        </div>
+        <p class="scale-hint">
+          Calculate from your scale bar:<br>
+          nm/px = <em>(scale bar nm)</em> ÷ <em>(scale bar pixels)</em><br>
+          Example: a 40 nm bar that is 700 px wide → 40 ÷ 700 = 0.0571 nm/px
+        </p>
+
+        <div class="divider">or</div>
+
+        <button type="submit" class="btn btn-outline" style="width:100%;justify-content:center;">
+          Continue with pixel values only
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+""".replace("{{ css }}", _BASE_CSS)
+
+
 REVIEW_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -592,8 +725,8 @@ REVIEW_HTML = """<!DOCTYPE html>
         </svg>
       </div>
       <div class="img-controls">
-        <button id="toggle-circles-btn" onclick="toggleCircles()">Hide Circles</button>
-        <button onclick="openZoom()">Zoom &nbsp;<kbd style="font-size:0.7rem;background:#eee;border:1px solid #ccc;border-radius:3px;padding:0 4px">Z</kbd></button>
+        <button type="button" id="toggle-circles-btn" onclick="toggleCircles()">Hide Circles</button>
+        <button type="button" onclick="openZoom()">Zoom &nbsp;<kbd style="font-size:0.7rem;background:#eee;border:1px solid #ccc;border-radius:3px;padding:0 4px">Z</kbd></button>
       </div>
       <p style="font-size:0.72rem;color:#90a4ae;margin-top:6px;text-align:center;">
         Click a circle to deselect &nbsp;·&nbsp; Solid = selected &nbsp;·&nbsp; Dashed = deselected
