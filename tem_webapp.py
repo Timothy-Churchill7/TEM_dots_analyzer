@@ -6,6 +6,7 @@ Run:  python3 tem_webapp.py
 Then open http://localhost:5000 in your browser.
 """
 
+import csv
 import io
 import os
 import sys
@@ -16,8 +17,6 @@ import numpy as np
 from PIL import Image
 from flask import (Flask, redirect, render_template_string,
                    request, send_file, session, url_for)
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
 # ── Import analysis functions from the sibling script ───────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
@@ -137,84 +136,26 @@ def run_analysis(tif_path: Path, scale_nm: float | None = None):
     return records, ann_filename, nm_per_pixel, img_w, img_h
 
 
-# ── Excel generation ──────────────────────────────────────────────────────────
+# ── CSV generation ────────────────────────────────────────────────────────────
 
-def build_excel(accumulated: list) -> io.BytesIO:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Quantum Dots"
-
-    # Styles
-    hdr_fill = PatternFill("solid", fgColor="1A2744")
-    hdr_font = Font(bold=True, color="FFFFFF", size=11)
-    alt_fill = PatternFill("solid", fgColor="EEF2F7")
-    thin = Side(style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center")
-
-    headers = [
-        "Session #", "Source File", "File Dot #", "Confidence",
-        "Length (nm)", "Length (px)", "X Position (px)", "Y Position (px)",
-    ]
-    col_widths = [11, 22, 12, 13, 14, 13, 17, 17]
-
-    for col, (h, w) in enumerate(zip(headers, col_widths), 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font = hdr_font
-        cell.fill = hdr_fill
-        cell.alignment = center
-        cell.border = border
-        ws.column_dimensions[cell.column_letter].width = w
-
-    ws.row_dimensions[1].height = 22
-
-    session_num = 0
-    for row_idx, rec in enumerate(accumulated, start=2):
-        session_num += 1
-        values = [
-            session_num,
-            rec.get("source_file", ""),
-            rec.get("dot_number", ""),
-            rec.get("confidence", ""),
-            rec.get("length_nm", ""),
-            rec.get("length_px", ""),
-            rec.get("centroid_x_px", ""),
-            rec.get("centroid_y_px", ""),
-        ]
-        fill = alt_fill if row_idx % 2 == 0 else None
-        for col, val in enumerate(values, 1):
-            cell = ws.cell(row=row_idx, column=col, value=val)
-            cell.alignment = center
-            cell.border = border
-            if fill:
-                cell.fill = fill
-
-    # Summary block (2 blank rows below data)
-    if accumulated:
-        sizes = [r["length_nm"] for r in accumulated if r.get("length_nm") is not None]
-        summary_start = len(accumulated) + 4
-        stat_fill = PatternFill("solid", fgColor="FFF8E1")
-        stat_hdr = Font(bold=True, size=10)
-        for label, value in [
-            ("Summary", ""),
-            ("Total dots", len(accumulated)),
-            ("Mean length (nm)", round(float(np.mean(sizes)), 3) if sizes else ""),
-            ("Std dev (nm)",     round(float(np.std(sizes)),  3) if sizes else ""),
-            ("Min length (nm)",  round(float(np.min(sizes)),  3) if sizes else ""),
-            ("Max length (nm)",  round(float(np.max(sizes)),  3) if sizes else ""),
-        ]:
-            ws.cell(row=summary_start, column=1, value=label).font = stat_hdr
-            ws.cell(row=summary_start, column=2, value=value)
-            ws.cell(row=summary_start, column=1).fill = stat_fill
-            ws.cell(row=summary_start, column=2).fill = stat_fill
-            summary_start += 1
-
-    ws.freeze_panes = "A2"
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
+def build_csv(accumulated: list) -> io.BytesIO:
+    fields = ["session_num", "source_file", "dot_number", "confidence",
+              "length_nm", "length_px", "centroid_x_px", "centroid_y_px"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    w.writeheader()
+    for i, rec in enumerate(accumulated, start=1):
+        w.writerow({
+            "session_num":    i,
+            "source_file":    rec.get("source_file", ""),
+            "dot_number":     rec.get("dot_number", ""),
+            "confidence":     rec.get("confidence", ""),
+            "length_nm":      rec.get("length_nm", ""),
+            "length_px":      rec.get("length_px", ""),
+            "centroid_x_px":  rec.get("centroid_x_px", ""),
+            "centroid_y_px":  rec.get("centroid_y_px", ""),
+        })
+    return io.BytesIO(buf.getvalue().encode("utf-8"))
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -299,10 +240,10 @@ def download():
     store = get_store()
     if not store["accumulated"]:
         return redirect(url_for("index"))
-    buf = build_excel(store["accumulated"])
+    buf = build_csv(store["accumulated"])
     return send_file(buf, as_attachment=True,
-                     download_name="quantum_dots.xlsx",
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                     download_name="quantum_dots.csv",
+                     mimetype="text/csv")
 
 
 @app.route("/image/<filename>")
@@ -443,7 +384,7 @@ INDEX_HTML = """<!DOCTYPE html>
     confirmed from <strong>{{ file_count }} image{{ 's' if file_count != 1 else '' }}</strong>
     &nbsp;·&nbsp;
     <a href="/download" class="btn btn-success" style="padding:4px 12px;font-size:0.8rem;">
-      Download Excel
+      Download CSV
     </a>
   </div>
   {% endif %}
@@ -471,7 +412,7 @@ INDEX_HTML = """<!DOCTYPE html>
   {% if dot_count > 0 %}
   <div style="text-align:center;margin-top:8px;">
     <a href="/download" class="btn btn-success btn-lg">
-      ⬇ Download Excel ({{ dot_count }} dot{{ 's' if dot_count != 1 else '' }})
+      ⬇ Download CSV ({{ dot_count }} dot{{ 's' if dot_count != 1 else '' }})
     </a>
   </div>
   {% endif %}
@@ -534,8 +475,32 @@ REVIEW_HTML = """<!DOCTYPE html>
 }
 .image-container img { width: 100%; display: block; }
 /* SVG dot circles */
-.dot-circle { transition: stroke-dasharray 0.15s, opacity 0.15s; }
+.dot-circle { transition: stroke-dasharray 0.15s, opacity 0.15s; cursor:pointer; }
 .dot-circle.deselected { stroke-dasharray: 7 5; opacity: 0.4; }
+/* Image control buttons */
+.img-controls { display:flex; gap:8px; margin-top:8px; justify-content:center; }
+.img-controls button {
+  font-size:0.78rem; padding:5px 12px; border-radius:5px; cursor:pointer;
+  border:1px solid #b0bec5; background:white; color:#37474f;
+}
+.img-controls button:hover { background:#eceff1; }
+/* Zoom modal */
+#zoom-modal {
+  display:none; position:fixed; inset:0;
+  background:rgba(0,0,0,0.92); z-index:9999; overflow:hidden;
+}
+#zoom-modal.active { display:block; }
+#zoom-inner {
+  position:absolute; top:0; left:0;
+  transform-origin:0 0; user-select:none; cursor:grab;
+}
+#zoom-inner.dragging { cursor:grabbing; }
+#zoom-inner img { display:block; }
+#zoom-hint {
+  position:fixed; bottom:18px; left:50%; transform:translateX(-50%);
+  color:rgba(255,255,255,0.55); font-size:0.78rem; pointer-events:none;
+  white-space:nowrap;
+}
 /* Dot grid */
 .dot-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
@@ -608,7 +573,7 @@ REVIEW_HTML = """<!DOCTYPE html>
     <div>
       <div class="image-container" onclick="window.open('/image/{{ image_file }}','_blank')">
         <img src="/image/{{ image_file }}" alt="TEM image" title="Click to open full size in new tab">
-        <svg viewBox="0 0 {{ img_width }} {{ img_height }}"
+        <svg id="dot-svg" viewBox="0 0 {{ img_width }} {{ img_height }}"
              preserveAspectRatio="xMidYMid meet"
              style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none">
           {% for rec in records %}
@@ -621,13 +586,17 @@ REVIEW_HTML = """<!DOCTYPE html>
                   fill="none"
                   stroke="#22dd22"
                   stroke-width="1"
-                  vector-effect="non-scaling-stroke"/>
+                  vector-effect="non-scaling-stroke"
+                  style="pointer-events:all"/>
           {% endfor %}
         </svg>
       </div>
-      <p style="font-size:0.75rem;color:#90a4ae;margin-top:6px;text-align:center;">
-        Click image to open full size &nbsp;·&nbsp;
-        Solid circle = selected &nbsp;·&nbsp; Dashed = deselected
+      <div class="img-controls">
+        <button id="toggle-circles-btn" onclick="toggleCircles()">Hide Circles</button>
+        <button onclick="openZoom()">Zoom &nbsp;<kbd style="font-size:0.7rem;background:#eee;border:1px solid #ccc;border-radius:3px;padding:0 4px">Z</kbd></button>
+      </div>
+      <p style="font-size:0.72rem;color:#90a4ae;margin-top:6px;text-align:center;">
+        Click a circle to deselect &nbsp;·&nbsp; Solid = selected &nbsp;·&nbsp; Dashed = deselected
       </p>
     </div>
 
@@ -681,48 +650,131 @@ REVIEW_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+// ── Tally ──────────────────────────────────────────────────────────────────
 function updateTally() {
   const boxes = document.querySelectorAll('input[name="valid_dots"]');
   const checked = [...boxes].filter(b => b.checked).length;
   document.getElementById('tally').textContent = checked + ' / ' + boxes.length + ' selected';
 }
 
-function toggleCircle(num, checked) {
+// ── Circle / card toggle ───────────────────────────────────────────────────
+function toggleDot(num, checked) {
+  // Update card
+  const card = document.querySelector(`.dot-card[data-num="${num}"]`);
+  if (card) {
+    const cb = card.querySelector('input[type=checkbox]');
+    cb.checked = checked;
+    card.classList.toggle('checked', checked);
+  }
+  // Update SVG circle
   const c = document.getElementById('svgdot-' + num);
   if (c) c.classList.toggle('deselected', !checked);
+  updateTally();
 }
 
+// Dot card clicks
 document.querySelectorAll('.dot-card').forEach(card => {
   card.addEventListener('click', e => {
     const num = parseInt(card.dataset.num);
     const cb = card.querySelector('input[type=checkbox]');
-    cb.checked = !cb.checked;
-    card.classList.toggle('checked', cb.checked);
-    toggleCircle(num, cb.checked);
-    updateTally();
+    toggleDot(num, !cb.checked);
     e.preventDefault();
+  });
+});
+
+// SVG circle clicks — click inside a circle to toggle that dot
+document.querySelectorAll('.dot-circle').forEach(circle => {
+  circle.addEventListener('click', e => {
+    e.stopPropagation(); // don't open full-size image
+    const num = parseInt(circle.id.replace('svgdot-', ''));
+    const cb = document.querySelector(`.dot-card[data-num="${num}"] input`);
+    if (cb) toggleDot(num, !cb.checked);
   });
 });
 
 function selectAll() {
   document.querySelectorAll('.dot-card').forEach(card => {
-    const num = parseInt(card.dataset.num);
-    card.querySelector('input').checked = true;
-    card.classList.add('checked');
-    toggleCircle(num, true);
+    toggleDot(parseInt(card.dataset.num), true);
   });
-  updateTally();
 }
 function selectNone() {
   document.querySelectorAll('.dot-card').forEach(card => {
-    const num = parseInt(card.dataset.num);
-    card.querySelector('input').checked = false;
-    card.classList.remove('checked');
-    toggleCircle(num, false);
+    toggleDot(parseInt(card.dataset.num), false);
   });
-  updateTally();
 }
+
+// ── Toggle circles visibility ──────────────────────────────────────────────
+let circlesVisible = true;
+function toggleCircles() {
+  circlesVisible = !circlesVisible;
+  document.getElementById('dot-svg').style.visibility = circlesVisible ? '' : 'hidden';
+  document.getElementById('toggle-circles-btn').textContent =
+    circlesVisible ? 'Hide Circles' : 'Show Circles';
+}
+
+// ── Zoom modal ─────────────────────────────────────────────────────────────
+let zs = 1, zx = 0, zy = 0, dragging = false, ddx = 0, ddy = 0;
+const zModal = document.getElementById('zoom-modal');
+const zInner = document.getElementById('zoom-inner');
+const zImg   = document.getElementById('zoom-img');
+
+function applyZoom() {
+  zInner.style.transform = `translate(${zx}px,${zy}px) scale(${zs})`;
+}
+function fitZoom() {
+  const iw = zImg.naturalWidth || zImg.width;
+  const ih = zImg.naturalHeight || zImg.height;
+  zs = Math.min(window.innerWidth / iw, window.innerHeight / ih) * 0.95;
+  zx = (window.innerWidth  - iw * zs) / 2;
+  zy = (window.innerHeight - ih * zs) / 2;
+  zImg.style.width  = iw + 'px';
+  zImg.style.height = ih + 'px';
+  applyZoom();
+}
+function openZoom() {
+  zModal.classList.add('active');
+  if (zImg.naturalWidth) fitZoom(); else zImg.onload = fitZoom;
+}
+function closeZoom() { zModal.classList.remove('active'); }
+
+zModal.addEventListener('wheel', e => {
+  e.preventDefault();
+  const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  zx = e.clientX - (e.clientX - zx) * f;
+  zy = e.clientY - (e.clientY - zy) * f;
+  zs *= f;
+  applyZoom();
+}, { passive: false });
+
+zInner.addEventListener('mousedown', e => {
+  dragging = true; ddx = e.clientX - zx; ddy = e.clientY - zy;
+  zInner.classList.add('dragging');
+});
+document.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  zx = e.clientX - ddx; zy = e.clientY - ddy; applyZoom();
+});
+document.addEventListener('mouseup', () => {
+  dragging = false; zInner.classList.remove('dragging');
+});
+zModal.addEventListener('click', e => { if (e.target === zModal) closeZoom(); });
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'z' || e.key === 'Z') {
+    zModal.classList.contains('active') ? closeZoom() : openZoom();
+  }
+  if (e.key === 'Escape') closeZoom();
+});
 </script>
+
+<!-- Zoom modal -->
+<div id="zoom-modal">
+  <div id="zoom-inner">
+    <img id="zoom-img" src="/image/{{ image_file }}" draggable="false">
+  </div>
+  <div id="zoom-hint">Scroll to zoom &nbsp;·&nbsp; Drag to pan &nbsp;·&nbsp; Z or Esc to close</div>
+</div>
 </body>
 </html>
 """.replace("{{ css }}", _BASE_CSS)
@@ -774,7 +826,7 @@ DONE_HTML = """<!DOCTYPE html>
 
     <div class="action-row">
       <a href="/download" class="btn btn-success btn-lg">
-        ⬇ Download Excel
+        ⬇ Download CSV
       </a>
       <a href="/" class="btn btn-outline btn-lg">
         ＋ Add Another TIF

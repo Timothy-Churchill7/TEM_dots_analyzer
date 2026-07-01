@@ -4,4 +4,3 @@ numpy
 Pillow
 scipy
 scikit-image
-openpyxl
