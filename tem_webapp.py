@@ -50,27 +50,69 @@ def get_store() -> dict:
             "current_img_width": 2048,
             "current_img_height": 2048,
             "current_bar_px": None,
+            "current_tif_path": None,   # pending upload awaiting scale entry
+            "current_scale_crop": None, # crop PNG of the scale-bar region
         }
     return STORE[sid]
 
 
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
-def run_analysis(tif_path: Path, scale_nm: float | None = None):
-    """
-    Load TIF, run dot detection and validation, save annotated PNG.
-
-    To keep runtime within free-tier limits the image is downscaled to half
-    resolution before analysis. All pixel coordinates are scaled back up
-    afterward; nm measurements are unaffected (the scale factor cancels out).
-    """
-    img = Image.open(tif_path)
-    arr = np.array(img)
+def _load_gray(tif_path: Path) -> np.ndarray:
+    """Load a TIF as a 2-D uint8 grayscale array."""
+    arr = np.array(Image.open(tif_path))
     if arr.ndim == 3:
         arr = np.mean(arr[..., :3], axis=2).astype(np.uint8)
+    return arr
 
-    # Downscale large images to half resolution for analysis.
+
+def detect_scale(tif_path: Path):
+    """
+    Detect the scale bar on the full-resolution image (where it is cleanest)
+    and save a cropped PNG of the scale-bar region so the user can read the
+    printed nm value.
+
+    Returns (bar_px, img_w, img_h, crop_filename).  bar_px is the scale-bar
+    length in pixels, or None if no bar was found.
+    """
+    arr = _load_gray(tif_path)
     h, w = arr.shape
+
+    info_bar_row = detect_info_bar_row(arr)
+    bar_px = detect_scale_bar_pixels(arr, info_bar_row)
+
+    # Crop the region that contains the scale bar + its printed number.
+    if info_bar_row is not None:
+        crop = arr[info_bar_row:, :]
+    else:
+        crop = arr[int(h * 0.82):, :]   # fall back to the bottom strip
+
+    crop_img = Image.fromarray(crop)
+    if crop_img.width > 1100:            # keep display size reasonable
+        ratio = 1100 / crop_img.width
+        crop_img = crop_img.resize(
+            (1100, max(1, int(crop_img.height * ratio))), Image.LANCZOS
+        )
+    crop_filename = uuid.uuid4().hex + ".png"
+    crop_img.save(WORK_DIR / crop_filename)
+
+    return bar_px, int(w), int(h), crop_filename
+
+
+def analyze_dots(tif_path: Path, nm_per_pixel: float | None = None):
+    """
+    Run dot detection and validation, save the annotated PNG.
+
+    nm_per_pixel is in FULL-resolution units (nm per full-image pixel), or None
+    for pixel-only output.  To stay within free-tier limits the image is
+    downscaled to half resolution for detection; coordinates are scaled back
+    up afterward and nm measurements are unaffected (the factor cancels out).
+
+    Returns (records, ann_filename, img_w, img_h).
+    """
+    arr = _load_gray(tif_path)
+    h, w = arr.shape
+
     if max(h, w) > 1024:
         inv = 2.0
         small = np.array(
@@ -80,30 +122,16 @@ def run_analysis(tif_path: Path, scale_nm: float | None = None):
         inv = 1.0
         small = arr
 
+    # Detection runs on the small image, so convert nm/px into small-image units.
+    nm_per_pixel_small = nm_per_pixel * inv if nm_per_pixel else None
+
     info_bar_row = detect_info_bar_row(small)
-    nm_per_pixel = None
-    bar_px_small = None
-
-    if info_bar_row is not None:
-        bar_px_small = detect_scale_bar_pixels(small, info_bar_row)
-        if bar_px_small:
-            if scale_nm is None:
-                # Heuristic: bars wider than 30 % of the image are typically 40 nm;
-                # narrower bars are typically 100 nm. Used only to calibrate blob
-                # detection radius; the user is asked to confirm/correct later.
-                scale_nm = 40.0 if bar_px_small / small.shape[1] > 0.3 else 100.0
-            # nm_per_pixel computed on the small image.
-            # length_nm = length_px_small * nm_per_pixel_small
-            #           = (length_px_full / inv) * (scale_nm / bar_px_small)
-            #           = length_px_full * nm_per_pixel_full  ✓
-            nm_per_pixel = scale_nm / bar_px_small
-
     analysis = small.copy()
     if info_bar_row is not None:
         analysis[info_bar_row:, :] = int(small[:info_bar_row].mean())
 
-    if nm_per_pixel:
-        px_per_nm = 1.0 / nm_per_pixel
+    if nm_per_pixel_small:
+        px_per_nm = 1.0 / nm_per_pixel_small
         min_r_px = (2.0 * px_per_nm) / 2.0
         max_r_px = (15.0 * px_per_nm) / 2.0
     else:
@@ -118,7 +146,7 @@ def run_analysis(tif_path: Path, scale_nm: float | None = None):
                               num_sigma=5)
     accepted, rejected, records = process_blobs(
         raw_blobs, analysis, info_bar_row,
-        nm_per_pixel=nm_per_pixel,
+        nm_per_pixel=nm_per_pixel_small,
         min_circularity=0.65,
         max_aspect_ratio=2.0,
     )
@@ -139,9 +167,7 @@ def run_analysis(tif_path: Path, scale_nm: float | None = None):
     ann_path = WORK_DIR / ann_filename
     save_annotated_image(arr, accepted, rejected, ann_path, info_bar_row_full)
 
-    img_w, img_h = int(arr.shape[1]), int(arr.shape[0])
-    bar_px_full = round(bar_px_small * inv) if bar_px_small else None
-    return records, ann_filename, nm_per_pixel, img_w, img_h, bar_px_full
+    return records, ann_filename, int(w), int(h)
 
 
 # ── CSV generation ────────────────────────────────────────────────────────────
@@ -184,17 +210,75 @@ def analyze():
     if not f or not f.filename:
         return redirect(url_for("index"))
 
-    # Save uploaded TIF to work dir
+    # Remove any previously pending upload that was never completed.
+    old = store.get("current_tif_path")
+    if old:
+        Path(old).unlink(missing_ok=True)
+
+    # Save uploaded TIF to work dir (kept until scale is applied).
     tif_name = Path(f.filename).name
     tif_path = WORK_DIR / (uuid.uuid4().hex + "_" + tif_name)
     f.save(tif_path)
 
     try:
-        records, ann_filename, nm_per_pixel, img_w, img_h, bar_px = run_analysis(tif_path)
+        bar_px, img_w, img_h, crop_file = detect_scale(tif_path)
+    except Exception as e:
+        tif_path.unlink(missing_ok=True)
+        return render_template_string(ERROR_HTML, message=str(e))
+
+    store["current_tif_path"] = str(tif_path)
+    store["current_tif_name"] = tif_name
+    store["current_img_width"] = img_w
+    store["current_img_height"] = img_h
+    store["current_bar_px"] = bar_px
+    store["current_scale_crop"] = crop_file
+
+    # Always ask the user to confirm the scale before detecting dots, so the
+    # dot-size calibration (and nm measurements) use the true scale.
+    return render_template_string(SCALE_HTML,
+        tif_name=tif_name,
+        crop_file=crop_file,
+        bar_px=bar_px,
+        dot_count=len(store["accumulated"]),
+        file_count=store["file_count"])
+
+
+@app.route("/apply-scale", methods=["POST"])
+def apply_scale():
+    store = get_store()
+    bar_px = store.get("current_bar_px")
+    tif_path = store.get("current_tif_path")
+
+    if not tif_path or not Path(tif_path).exists():
+        return redirect(url_for("index"))
+
+    # Resolve nm/pixel from the user's input.
+    nm_per_pixel = None
+    if not request.form.get("skip"):
+        try:
+            scale_nm_str = request.form.get("scale_nm", "").strip()
+            nm_per_px_str = request.form.get("nm_per_pixel", "").strip()
+            if scale_nm_str and bar_px:
+                scale_nm = float(scale_nm_str)
+                if scale_nm <= 0:
+                    raise ValueError
+                nm_per_pixel = scale_nm / bar_px
+            elif nm_per_px_str:
+                nm_per_pixel = float(nm_per_px_str)
+                if nm_per_pixel <= 0:
+                    raise ValueError
+        except (ValueError, TypeError):
+            nm_per_pixel = None  # bad input — fall back to pixel-only values
+
+    # Detect dots using the confirmed scale.
+    try:
+        records, ann_filename, img_w, img_h = analyze_dots(
+            Path(tif_path), nm_per_pixel)
     except Exception as e:
         return render_template_string(ERROR_HTML, message=str(e))
     finally:
-        tif_path.unlink(missing_ok=True)
+        Path(tif_path).unlink(missing_ok=True)
+        store["current_tif_path"] = None
 
     if not records:
         return render_template_string(ERROR_HTML,
@@ -203,67 +287,18 @@ def analyze():
 
     store["current_records"] = records
     store["current_image_file"] = ann_filename
-    store["current_tif_name"] = tif_name
     store["current_img_width"] = img_w
     store["current_img_height"] = img_h
-    store["current_bar_px"] = bar_px
-
-    # Scale bar pixel length detected but nm value unknown — ask the user.
-    # (nm_per_pixel is None whenever scale_nm was not supplied explicitly.)
-    if nm_per_pixel is None:
-        return render_template_string(SCALE_HTML,
-            tif_name=tif_name,
-            image_file=ann_filename,
-            bar_px=bar_px,
-            dot_count=len(store["accumulated"]),
-            file_count=store["file_count"])
 
     return render_template_string(REVIEW_HTML,
-        tif_name=tif_name,
+        tif_name=store["current_tif_name"],
         records=records,
         image_file=ann_filename,
         img_width=img_w,
         img_height=img_h,
         dot_count=len(store["accumulated"]),
         file_count=store["file_count"],
-        nm_calibrated=True)
-
-
-@app.route("/apply-scale", methods=["POST"])
-def apply_scale():
-    store = get_store()
-    records = store["current_records"]
-    bar_px = store.get("current_bar_px")
-
-    nm_per_pixel = None
-    try:
-        scale_nm_str = request.form.get("scale_nm", "").strip()
-        nm_per_px_str = request.form.get("nm_per_pixel", "").strip()
-        if scale_nm_str and bar_px:
-            scale_nm = float(scale_nm_str)
-            if scale_nm <= 0:
-                raise ValueError
-            nm_per_pixel = scale_nm / bar_px
-        elif nm_per_px_str:
-            nm_per_pixel = float(nm_per_px_str)
-            if nm_per_pixel <= 0:
-                raise ValueError
-        if nm_per_pixel:
-            for rec in records:
-                rec["length_nm"] = round(rec["length_px"] * nm_per_pixel, 3)
-        nm_calibrated = nm_per_pixel is not None
-    except (ValueError, TypeError):
-        nm_calibrated = False  # user skipped — keep pixel-only values
-
-    return render_template_string(REVIEW_HTML,
-        tif_name=store["current_tif_name"],
-        records=records,
-        image_file=store["current_image_file"],
-        img_width=store["current_img_width"],
-        img_height=store["current_img_height"],
-        dot_count=len(store["accumulated"]),
-        file_count=store["file_count"],
-        nm_calibrated=nm_calibrated)
+        nm_calibrated=nm_per_pixel is not None)
 
 
 @app.route("/confirm", methods=["POST"])
@@ -316,6 +351,9 @@ def serve_image(filename):
 def reset():
     sid = session.get("sid")
     if sid and sid in STORE:
+        pending = STORE[sid].get("current_tif_path")
+        if pending:
+            Path(pending).unlink(missing_ok=True)
         del STORE[sid]
     session.clear()
     return redirect(url_for("index"))
@@ -523,32 +561,35 @@ SCALE_HTML = """<!DOCTYPE html>
 <title>Scale Calibration — {{ tif_name }}</title>
 <style>
 {{ css }}
-.scale-layout { display: grid; grid-template-columns: 1fr 380px; gap: 24px; align-items: start; }
-@media (max-width: 700px) { .scale-layout { grid-template-columns: 1fr; } }
-.img-thumb { border-radius: 8px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.15); background:#111; }
-.img-thumb img { width: 100%; display: block; }
+.crop-box {
+  border-radius: 8px; overflow: hidden; background: #111;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15); margin-bottom: 8px;
+}
+.crop-box img { width: 100%; display: block; }
+.crop-caption { font-size: 0.8rem; color: #90a4ae; text-align: center; margin-bottom: 22px; }
 .info-banner {
   background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px;
-  padding: 14px 18px; margin-bottom: 20px; font-size: 0.9rem; color: #1565c0;
+  padding: 14px 18px; margin-bottom: 20px; font-size: 0.92rem; color: #1565c0;
   display: flex; align-items: flex-start; gap: 10px;
 }
 .warn-banner {
   background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px;
-  padding: 14px 18px; margin-bottom: 20px; font-size: 0.9rem; color: #5d4037;
+  padding: 14px 18px; margin-bottom: 20px; font-size: 0.92rem; color: #5d4037;
   display: flex; align-items: flex-start; gap: 10px;
 }
-.scale-label { font-size: 0.88rem; font-weight: 600; color: #37474f; display: block; margin-bottom: 6px; }
+.scale-label { font-size: 0.9rem; font-weight: 600; color: #37474f; display: block; margin-bottom: 6px; }
 .scale-input-row { display: flex; gap: 10px; align-items: center; margin: 8px 0 16px; }
 .scale-input-row input {
-  flex: 1; padding: 10px 12px; border: 1.5px solid #b0bec5; border-radius: 7px;
-  font-size: 1.05rem; outline: none;
+  flex: 1; padding: 12px 14px; border: 1.5px solid #b0bec5; border-radius: 7px;
+  font-size: 1.15rem; outline: none;
 }
 .scale-input-row input:focus { border-color: #1976d2; }
-.scale-input-row .unit { font-weight: 600; color: #37474f; white-space: nowrap; }
-.scale-hint { font-size: 0.8rem; color: #78909c; margin-bottom: 20px; line-height: 1.5; }
+.scale-input-row .unit { font-weight: 600; color: #37474f; white-space: nowrap; font-size: 1.05rem; }
+.scale-hint { font-size: 0.82rem; color: #78909c; margin-bottom: 20px; line-height: 1.5; }
 .divider { display:flex; align-items:center; gap:12px; color:#b0bec5;
            font-size:0.8rem; margin: 20px 0; }
 .divider::before, .divider::after { content:''; flex:1; height:1px; background:#e0e0e0; }
+.scale-wrap { max-width: 760px; margin: 0 auto; }
 </style>
 </head>
 <body>
@@ -559,7 +600,8 @@ SCALE_HTML = """<!DOCTYPE html>
   </div>
 </header>
 
-<div class="container wide" style="padding-top:24px;">
+<div class="container" style="padding-top:24px;">
+ <div class="scale-wrap">
   {% if dot_count > 0 %}
   <div class="badge" style="margin-bottom:20px;">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -569,81 +611,76 @@ SCALE_HTML = """<!DOCTYPE html>
   </div>
   {% endif %}
 
-  <div class="scale-layout">
-    <div>
-      <div class="img-thumb">
-        <img src="/image/{{ image_file }}" alt="TEM image — scale bar visible at bottom">
-      </div>
-      <p style="font-size:0.78rem;color:#90a4ae;margin-top:8px;text-align:center;">
-        Scale bar visible at the bottom of the image
-      </p>
-    </div>
-
-    <div class="card" style="padding:24px;">
-
-      {% if bar_px %}
-      <!-- Scale bar detected — just need the nm number -->
-      <div class="info-banner">
-        <span style="font-size:1.2rem;">📏</span>
-        <div>
-          <strong>Scale bar detected</strong> ({{ bar_px }} px wide).<br>
-          Enter the nm value shown on your scale bar.
-        </div>
-      </div>
-
-      <form action="/apply-scale" method="post">
-        <label class="scale-label">What does your scale bar represent?</label>
-        <div class="scale-input-row">
-          <input type="number" name="scale_nm" step="any" min="1"
-                 placeholder="e.g. 40 or 100" autofocus>
-          <span class="unit">nm</span>
-          <button type="submit" class="btn btn-primary">Apply →</button>
-        </div>
-        <p class="scale-hint">
-          Look at the number printed next to the scale bar at the bottom of your image
-          (typically 40 nm or 100 nm for these samples).
-        </p>
-
-        <div class="divider">or</div>
-
-        <button type="submit" class="btn btn-outline" style="width:100%;justify-content:center;">
-          Continue with pixel values only
-        </button>
-      </form>
-
-      {% else %}
-      <!-- Scale bar not detected — ask for nm/px -->
-      <div class="warn-banner">
-        <span style="font-size:1.2rem;">⚠️</span>
-        <div>
-          <strong>Scale bar not auto-detected.</strong><br>
-          Enter the calibration manually to get nm measurements, or skip to use pixel values only.
-        </div>
-      </div>
-
-      <form action="/apply-scale" method="post">
-        <label class="scale-label">Nanometres per pixel (nm/px)</label>
-        <div class="scale-input-row">
-          <input type="number" name="nm_per_pixel" step="any" min="0.0001"
-                 placeholder="e.g. 0.0571" autofocus>
-          <button type="submit" class="btn btn-primary">Apply →</button>
-        </div>
-        <p class="scale-hint">
-          Calculate from your scale bar:<br>
-          nm/px = <em>(scale bar nm)</em> ÷ <em>(scale bar pixels)</em><br>
-          Example: a 40 nm bar that is 700 px wide → 40 ÷ 700 = 0.0571 nm/px
-        </p>
-
-        <div class="divider">or</div>
-
-        <button type="submit" class="btn btn-outline" style="width:100%;justify-content:center;">
-          Continue with pixel values only
-        </button>
-      </form>
-      {% endif %}
-
-    </div>
+  <div class="crop-box">
+    <img src="/image/{{ crop_file }}" alt="Scale bar region from your image">
   </div>
+  <p class="crop-caption">Scale-bar region cropped from your image — read the number printed on it.</p>
+
+  <div class="card" style="padding:24px;">
+
+    {% if bar_px %}
+    <!-- Scale bar detected — just need the nm number the microscope printed -->
+    <div class="info-banner">
+      <span style="font-size:1.2rem;">📏</span>
+      <div>
+        <strong>Scale bar detected</strong> — {{ bar_px }} px long.
+        Type the number printed on it (shown above).
+      </div>
+    </div>
+
+    <form action="/apply-scale" method="post">
+      <label class="scale-label">The scale bar represents…</label>
+      <div class="scale-input-row">
+        <input type="number" name="scale_nm" step="any" min="0.0001"
+               placeholder="e.g. 200" autofocus>
+        <span class="unit">nm</span>
+        <button type="submit" class="btn btn-primary">Detect dots →</button>
+      </div>
+      <p class="scale-hint">
+        Just enter the number (e.g. 40, 100, or 200). The pixel length is measured
+        automatically, so nm-per-pixel is calculated for you.
+      </p>
+
+      <div class="divider">or</div>
+
+      <button type="submit" name="skip" value="1" class="btn btn-outline" style="width:100%;justify-content:center;">
+        Skip — use pixel values only
+      </button>
+    </form>
+
+    {% else %}
+    <!-- Scale bar not detected — ask for nm/px directly -->
+    <div class="warn-banner">
+      <span style="font-size:1.2rem;">⚠️</span>
+      <div>
+        <strong>Scale bar not auto-detected.</strong>
+        Enter the calibration manually to get nm measurements, or skip for pixel values only.
+      </div>
+    </div>
+
+    <form action="/apply-scale" method="post">
+      <label class="scale-label">Nanometres per pixel (nm/px)</label>
+      <div class="scale-input-row">
+        <input type="number" name="nm_per_pixel" step="any" min="0.0001"
+               placeholder="e.g. 0.0571" autofocus>
+        <button type="submit" class="btn btn-primary">Detect dots →</button>
+      </div>
+      <p class="scale-hint">
+        Calculate from your scale bar:<br>
+        nm/px = <em>(scale bar nm)</em> ÷ <em>(scale bar pixels)</em><br>
+        Example: a 40 nm bar that is 700 px wide → 40 ÷ 700 = 0.0571 nm/px
+      </p>
+
+      <div class="divider">or</div>
+
+      <button type="submit" name="skip" value="1" class="btn btn-outline" style="width:100%;justify-content:center;">
+        Skip — use pixel values only
+      </button>
+    </form>
+    {% endif %}
+
+  </div>
+ </div>
 </div>
 </body>
 </html>

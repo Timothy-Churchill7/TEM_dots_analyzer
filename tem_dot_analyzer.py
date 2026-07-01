@@ -56,32 +56,42 @@ def detect_info_bar_row(arr):
     return first_bright
 
 
-def detect_scale_bar_pixels(arr, info_bar_row):
+def detect_scale_bar_pixels(arr, info_bar_row, dark_thr=45, gap_tol=3):
     """
-    Within the info bar, find the longest contiguous black horizontal line
+    Within the info bar, find the longest horizontal run of dark pixels
     (the scale bar) and return its pixel length.  Returns None if not found.
+
+    Runs are measured with a small gap tolerance so that anti-aliasing from
+    image resampling (which turns solid-black bar pixels into values of 1-40)
+    does not fragment the bar.  Best run this on the full-resolution image,
+    where the bar is cleanest.
     """
     if info_bar_row is None:
         return None
-    width = arr.shape[1]
-    info = arr[info_bar_row:, :]
+    height = arr.shape[0]
     best_length = 0
-    for i in range(info.shape[0]):
-        row = info[i]
-        if row[row > 200].size < 50:
+    for i in range(info_bar_row, height):
+        row = arr[i]
+        # The scale bar sits on a bright info bar / white box; skip rows that
+        # have no bright background (avoids matching dark image content).
+        if np.count_nonzero(row > 200) < 50:
             continue
-        in_run, start, best_run = False, 0, 0
-        for c, v in enumerate(row):
-            if v <= 5 and not in_run:
-                in_run, start = True, c
-            elif v > 5 and in_run:
-                in_run = False
-                best_run = max(best_run, c - start)
-        if in_run:
-            best_run = max(best_run, width - start)
+        run = best_run = gap = 0
+        for v in row:
+            if v <= dark_thr:
+                run += 1
+                gap = 0
+                if run > best_run:
+                    best_run = run
+            else:
+                gap += 1
+                if gap <= gap_tol and run > 0:
+                    run += 1          # bridge a small bright gap
+                else:
+                    run = 0
         if best_run > best_length:
             best_length = best_run
-    return best_length if best_length > 10 else None
+    return int(best_length) if best_length > 20 else None
 
 
 # ---------------------------------------------------------------------------
