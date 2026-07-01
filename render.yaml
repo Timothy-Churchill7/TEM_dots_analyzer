@@ -3,7 +3,7 @@ services:
     name: tem-dot-analyzer
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn tem_webapp:app --timeout 120
+    startCommand: gunicorn tem_webapp:app --timeout 300 --workers 1
     envVars:
       - key: SECRET_KEY
         generateValue: true

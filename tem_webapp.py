@@ -682,6 +682,19 @@ SCALE_HTML = """<!DOCTYPE html>
   </div>
  </div>
 </div>
+
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <div style="font-size:1.15rem;font-weight:600;">Detecting dots…</div>
+  <div style="font-size:0.85rem;opacity:0.8;">This can take up to a minute on the free server.</div>
+</div>
+<script>
+document.querySelectorAll('form').forEach(function (f) {
+  f.addEventListener('submit', function () {
+    document.getElementById('loading-overlay').style.display = 'flex';
+  });
+});
+</script>
 </body>
 </html>
 """.replace("{{ css }}", _BASE_CSS)
