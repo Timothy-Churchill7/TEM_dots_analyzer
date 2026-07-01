@@ -88,7 +88,7 @@ def detect_scale_bar_pixels(arr, info_bar_row):
 # LoG blob detection
 # ---------------------------------------------------------------------------
 
-def detect_blobs(arr, min_sigma, max_sigma, threshold, overlap=0.5, denoise=1.5):
+def detect_blobs(arr, min_sigma, max_sigma, threshold, overlap=0.5, denoise=1.5, num_sigma=10):
     """
     Detect dark circular blobs via Laplacian-of-Gaussian on the inverted image.
     Returns array of shape (N, 3): [row, col, sigma].
@@ -99,7 +99,7 @@ def detect_blobs(arr, min_sigma, max_sigma, threshold, overlap=0.5, denoise=1.5)
         inverted,
         min_sigma=min_sigma,
         max_sigma=max_sigma,
-        num_sigma=10,
+        num_sigma=num_sigma,
         threshold=threshold,
         overlap=overlap,
     )

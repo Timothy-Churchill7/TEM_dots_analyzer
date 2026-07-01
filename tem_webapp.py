@@ -57,39 +57,59 @@ def get_store() -> dict:
 def run_analysis(tif_path: Path, scale_nm: float | None = None):
     """
     Load TIF, run dot detection and validation, save annotated PNG.
-    Returns (records, annotated_png_path, nm_per_pixel or None).
+
+    To keep runtime within free-tier limits the image is downscaled to half
+    resolution before analysis. All pixel coordinates are scaled back up
+    afterward; nm measurements are unaffected (the scale factor cancels out).
     """
     img = Image.open(tif_path)
     arr = np.array(img)
     if arr.ndim == 3:
         arr = np.mean(arr[..., :3], axis=2).astype(np.uint8)
 
-    info_bar_row = detect_info_bar_row(arr)
+    # Downscale large images to half resolution for analysis.
+    h, w = arr.shape
+    if max(h, w) > 1024:
+        inv = 2.0
+        small = np.array(
+            Image.fromarray(arr).resize((w // 2, h // 2), Image.LANCZOS)
+        )
+    else:
+        inv = 1.0
+        small = arr
+
+    info_bar_row = detect_info_bar_row(small)
     nm_per_pixel = None
 
     if info_bar_row is not None:
-        bar_px = detect_scale_bar_pixels(arr, info_bar_row)
+        bar_px = detect_scale_bar_pixels(small, info_bar_row)
         if bar_px:
             if scale_nm is None:
-                scale_nm = 40.0 if bar_px / arr.shape[1] > 0.3 else 100.0
+                scale_nm = 40.0 if bar_px / small.shape[1] > 0.3 else 100.0
+            # nm_per_pixel computed on the small image.
+            # length_nm = length_px_small * nm_per_pixel_small
+            #           = (length_px_full / inv) * (scale_nm / bar_px_small)
+            #           = length_px_full * nm_per_pixel_full  ✓
             nm_per_pixel = scale_nm / bar_px
 
-    analysis = arr.copy()
+    analysis = small.copy()
     if info_bar_row is not None:
-        analysis[info_bar_row:, :] = int(arr[:info_bar_row].mean())
+        analysis[info_bar_row:, :] = int(small[:info_bar_row].mean())
 
     if nm_per_pixel:
         px_per_nm = 1.0 / nm_per_pixel
         min_r_px = (2.0 * px_per_nm) / 2.0
         max_r_px = (15.0 * px_per_nm) / 2.0
     else:
-        min_r_px, max_r_px = 5.0, 150.0
+        min_r_px, max_r_px = 5.0, 75.0
 
     min_sigma = min_r_px / np.sqrt(2)
     max_sigma = max_r_px / np.sqrt(2)
 
+    # num_sigma=5 is enough since regionprops gives continuous diameter anyway
     raw_blobs = detect_blobs(analysis, min_sigma, max_sigma,
-                              threshold=0.12, overlap=0.5, denoise=1.5)
+                              threshold=0.12, overlap=0.5, denoise=1.5,
+                              num_sigma=5)
     accepted, rejected, records = process_blobs(
         raw_blobs, analysis, info_bar_row,
         nm_per_pixel=nm_per_pixel,
@@ -97,9 +117,21 @@ def run_analysis(tif_path: Path, scale_nm: float | None = None):
         max_aspect_ratio=2.0,
     )
 
+    # Scale pixel coordinates back to full-resolution. nm values stay as-is.
+    if inv != 1.0:
+        accepted = [(y * inv, x * inv, sigma * inv) for y, x, sigma in accepted]
+        rejected = [(y * inv, x * inv, sigma * inv) for y, x, sigma in rejected]
+        info_bar_row_full = int(info_bar_row * inv) if info_bar_row is not None else None
+        for rec in records:
+            rec["centroid_x_px"] = round(rec["centroid_x_px"] * inv, 1)
+            rec["centroid_y_px"] = round(rec["centroid_y_px"] * inv, 1)
+            rec["length_px"]     = round(rec["length_px"] * inv, 2)
+    else:
+        info_bar_row_full = info_bar_row
+
     ann_filename = uuid.uuid4().hex + ".png"
     ann_path = WORK_DIR / ann_filename
-    save_annotated_image(arr, accepted, rejected, ann_path, info_bar_row)
+    save_annotated_image(arr, accepted, rejected, ann_path, info_bar_row_full)
 
     img_w, img_h = int(arr.shape[1]), int(arr.shape[0])
     return records, ann_filename, nm_per_pixel, img_w, img_h
