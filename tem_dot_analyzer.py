@@ -72,9 +72,9 @@ def detect_scale_bar_pixels(arr, info_bar_row):
             continue
         in_run, start, best_run = False, 0, 0
         for c, v in enumerate(row):
-            if v == 0 and not in_run:
+            if v <= 5 and not in_run:
                 in_run, start = True, c
-            elif v != 0 and in_run:
+            elif v > 5 and in_run:
                 in_run = False
                 best_run = max(best_run, c - start)
         if in_run:
