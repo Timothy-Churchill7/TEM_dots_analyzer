@@ -2,7 +2,8 @@
 """
 TEM Quantum Dot Analyzer
 Detects dark quantum dot particles in TEM TIF images, measures their diameter,
-and exports a CSV with dot number and length (equivalent diameter in nm and px).
+and exports a CSV with dot number and length. Each dot is fit to an ellipse and
+its diameter is the mean of the ellipse's major and minor axes (in nm and px).
 
 Only dots that pass a shape-validation check are counted: clumps, touching
 aggregates, chains, and otherwise ambiguous regions are silently excluded.
@@ -133,7 +134,8 @@ def validate_blob_shape(arr, y, x, sigma,
          while preserving the dot's ~2r-scale structure.
       3. Threshold at the midpoint between the local background and the darkest
          pixel within r of the centre.
-      4. Measure the resulting binary region with skimage.measure.regionprops.
+      4. Measure the resulting binary region with skimage.measure.regionprops,
+         fitting an ellipse and taking the mean of its two axis diameters.
       5. Reject if circularity < min_circularity, aspect ratio > max_aspect_ratio,
          or the region area is more than max_area_ratio × π r² (clump).
 
@@ -216,9 +218,18 @@ def validate_blob_shape(arr, y, x, sigma,
         and area_ratio <= max_area_ratio
     )
 
-    # Equivalent diameter of the measured region (more accurate than LoG sigma)
-    measured_diam_px = float(p.equivalent_diameter_area) if hasattr(p, "equivalent_diameter_area") \
-        else float(np.sqrt(4 * p.area / np.pi))
+    # Fit an ellipse to the dot (regionprops derives the best-fit ellipse from
+    # the region's second moments) and report the mean of its major and minor
+    # axis diameters as the final diameter. This captures elongated dots better
+    # than assuming a circle.
+    axis_major_px = float(p.axis_major_length)
+    axis_minor_px = float(p.axis_minor_length)
+    if axis_major_px > 0 and axis_minor_px > 0:
+        measured_diam_px = (axis_major_px + axis_minor_px) / 2.0
+    else:
+        # Degenerate region (e.g. a thin line) — fall back to area-equivalent.
+        measured_diam_px = float(p.equivalent_diameter_area) if hasattr(p, "equivalent_diameter_area") \
+            else float(np.sqrt(4 * p.area / np.pi))
 
     # Confidence: product of three independent shape quality scores (0–1 each).
     # circularity: 1 = perfect circle
@@ -235,6 +246,8 @@ def validate_blob_shape(arr, y, x, sigma,
         "circularity": round(circularity, 3),
         "aspect_ratio": round(aspect_ratio, 3),
         "area_ratio": round(area_ratio, 3),
+        "axis_major_px": axis_major_px,
+        "axis_minor_px": axis_minor_px,
         "measured_diam_px": measured_diam_px,
         "confidence": confidence,
     }
