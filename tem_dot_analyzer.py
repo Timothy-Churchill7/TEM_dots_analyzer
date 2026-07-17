@@ -242,12 +242,17 @@ def validate_blob_shape(arr, y, x, sigma,
         4,
     )
 
+    # Ellipse tilt as an SVG rotation angle (degrees clockwise from +x, in the
+    # image's y-down coordinates). See regionprops.orientation.
+    orientation_deg = float((90.0 - np.degrees(p.orientation)) % 180.0)
+
     return is_valid, {
         "circularity": round(circularity, 3),
         "aspect_ratio": round(aspect_ratio, 3),
         "area_ratio": round(area_ratio, 3),
         "axis_major_px": axis_major_px,
         "axis_minor_px": axis_minor_px,
+        "orientation_deg": round(orientation_deg, 1),
         "measured_diam_px": measured_diam_px,
         "confidence": confidence,
     }
@@ -311,6 +316,10 @@ def process_blobs(raw_blobs, arr, info_bar_row, nm_per_pixel,
             "centroid_x_px": round(float(x), 1),
             "centroid_y_px": round(float(y), 1),
             "length_px": round(best_diam_px, 2),
+            # Ellipse geometry for drawing the fitted oval overlay.
+            "axis_major_px": round(metrics.get("axis_major_px", best_diam_px), 2),
+            "axis_minor_px": round(metrics.get("axis_minor_px", best_diam_px), 2),
+            "orientation_deg": metrics.get("orientation_deg", 0.0),
         }
         if nm_per_pixel is not None:
             rec["length_nm"] = round(best_diam_px * nm_per_pixel, 3)

@@ -160,6 +160,9 @@ def analyze_dots(tif_path: Path, nm_per_pixel: float | None = None):
             rec["centroid_x_px"] = round(rec["centroid_x_px"] * inv, 1)
             rec["centroid_y_px"] = round(rec["centroid_y_px"] * inv, 1)
             rec["length_px"]     = round(rec["length_px"] * inv, 2)
+            rec["axis_major_px"] = round(rec["axis_major_px"] * inv, 2)
+            rec["axis_minor_px"] = round(rec["axis_minor_px"] * inv, 2)
+            # orientation_deg is scale-invariant — no change needed.
     else:
         info_bar_row_full = info_bar_row
 
@@ -820,12 +823,17 @@ REVIEW_HTML = """<!DOCTYPE html>
              preserveAspectRatio="xMidYMid meet"
              style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none">
           {% for rec in records %}
-          {% set r = rec.length_px / 2 + 5 %}
-          <circle id="svgdot-{{ rec.dot_number }}"
+          {# Enlarge the fitted ellipse by a constant factor so the outline sits
+             just outside the dot while preserving its true major/minor ratio. #}
+          {% set rx = rec.axis_major_px / 2 * 1.25 %}
+          {% set ry = rec.axis_minor_px / 2 * 1.25 %}
+          <ellipse id="svgdot-{{ rec.dot_number }}"
                   class="dot-circle"
                   cx="{{ rec.centroid_x_px }}"
                   cy="{{ rec.centroid_y_px }}"
-                  r="{{ r }}"
+                  rx="{{ rx }}"
+                  ry="{{ ry }}"
+                  transform="rotate({{ rec.orientation_deg }} {{ rec.centroid_x_px }} {{ rec.centroid_y_px }})"
                   fill="none"
                   stroke="#22dd22"
                   stroke-width="1"
@@ -835,11 +843,11 @@ REVIEW_HTML = """<!DOCTYPE html>
         </svg>
       </div>
       <div class="img-controls">
-        <button type="button" id="toggle-circles-btn" onclick="toggleCircles()">Hide Circles</button>
+        <button type="button" id="toggle-circles-btn" onclick="toggleCircles()">Hide Outlines</button>
         <button type="button" onclick="openZoom()">Zoom &nbsp;<kbd style="font-size:0.7rem;background:#eee;border:1px solid #ccc;border-radius:3px;padding:0 4px">Z</kbd></button>
       </div>
       <p style="font-size:0.72rem;color:#90a4ae;margin-top:6px;text-align:center;">
-        Click a circle to deselect &nbsp;·&nbsp; Solid = selected &nbsp;·&nbsp; Dashed = deselected
+        Click an outline to deselect &nbsp;·&nbsp; Solid = selected &nbsp;·&nbsp; Dashed = deselected
       </p>
     </div>
 
@@ -952,7 +960,7 @@ function toggleCircles() {
   circlesVisible = !circlesVisible;
   document.getElementById('dot-svg').style.visibility = circlesVisible ? '' : 'hidden';
   document.getElementById('toggle-circles-btn').textContent =
-    circlesVisible ? 'Hide Circles' : 'Show Circles';
+    circlesVisible ? 'Hide Outlines' : 'Show Outlines';
 }
 
 // ── Zoom modal ─────────────────────────────────────────────────────────────
